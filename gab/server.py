@@ -1,3 +1,4 @@
+import ssl
 import logging
 import datetime
 import asyncio
@@ -11,27 +12,68 @@ log = logging.getLogger(__name__)
 
 def build_subparser(subparser):
     subparser.add_argument("url", action="append")
+    subparser.add_argument("--nick", default="gab")
+    subparser.add_argument("--listen", default="localhost")
+    subparser.add_argument("--port", default=6666, type=int)
 
 
 class Client(object):
-    def __init__(self, reader, writer):
+    def __init__(self, connection):
+        self.connection = connection
         self.outgoing = asyncio.Queue()
-        asyncio.ensure_future(self.handle_read(reader))
-        asyncio.ensure_future(self.handle_write(writer))
+        self.connected = True
+
+    def disconnect(self):
+        self.connected = False
+
+    def send(self, message):
+        self.outgoing.put_nowait(message)
 
     async def handle_read(self, reader):
-        pass
+        while self.connected:
+            data = await reader.readline()
+            line = data.decode().strip()
+            if not line:
+                break
+            message = Message.parse(line)
+
+            if message.command in ["NICK", "USER"]:  # dont reauth
+                continue
+
+            self.connection.send(message)
+        self.connected = False
 
     async def handle_write(self, writer):
-        pass
+        while self.connected:
+            message = await self.outgoing.get()
+            if not message:
+                break
+            writer.write(message.serialize())
+        self.connected = False
+        writer.close()
 
 
-def handle_client(reader, writer):
-    Client(reader, writer)
+class Server(object):
+    def __init__(self, connection):
+        self.connection = connection
+        self.server = None
+
+    async def close(self):
+        self.server.close()
+        await self.server.wait_closed()
+
+    async def create(self, host, port):
+        self.server = await asyncio.start_server(self.handle_client, host, port)
+
+    def handle_client(self, reader, writer):
+        client = Client(self.connection)
+
+        asyncio.ensure_future(client.handle_read(reader))
+        asyncio.ensure_future(client.handle_write(writer))
+        self.connection.add_client(client)
 
 
 def parse_host_port(url):
-
     host = url.netloc
     ssl = False
     if ":" in url.netloc:
@@ -46,19 +88,34 @@ def parse_host_port(url):
 
 
 class Message(object):
-    def __init__(self, prefix, command, args):
+    def __init__(self, command, *args, prefix=None):
         self.timestamp = datetime.datetime.utcnow()
         self.prefix = prefix
         self.command = command
         self.args = args
 
     def __str__(self):
-        return "<Message(prefix={}, command={}, args={})>".format(self.prefix, self.command, self.args)
+        return "<Message(prefix={}, command={}, args={})>".format(self.prefix or "", self.command, self.args)
+
+    def serialize(self):
+        parts = ([":" + self.prefix] if self.prefix else []) + [self.command]
+        if self.args:
+            parts.extend([str(arg) for arg in self.args[:-1]] + [":" + self.args[-1]])
+        line = " ".join(parts) + "\r\n"
+        return line.encode()
 
     @classmethod
     def parse(cls, message):
         prefix, command, args = parsemsg(message)
-        return cls(prefix, command, args)
+        return cls(command, *args, prefix=prefix)
+
+    @classmethod
+    def nick(cls, nick):
+        return cls("NICK", nick)
+
+    @classmethod
+    def user(cls, user, realname=None, mode="i"):
+        return cls("USER", user, mode, "*", realname or user)
 
 
 class MessageHandler(object):
@@ -103,61 +160,73 @@ class MessageHandler(object):
         self.connection.send("PONG", message.args[0])
 
 
-class Buffer(object):
+class MessageBuffer(object):
     def __init__(self):
         self.messages = []
+
+    def clear(self):
+        self.messages.clear()
 
     def add(self, message):
         self.messages.append(message)
 
 
 class IRC(object):
-    def __init__(self, connection):
-        self.connection = connection
-        self.server_messages = Buffer()
+    def __init__(self):
+        self.server_messages = MessageBuffer()
         self.clients = collections.OrderedDict()
 
     def add_server_message(self, message):
         self.server_messages.add(message)
 
 
-class Connection(object):
+class IRCConnection(object):
     def __init__(self, url, nick):
-        self.url = url
+        self.host, self.port, self.ssl = parse_host_port(url)
         self.nick = nick
         self.outgoing = asyncio.Queue()
+        self.handler = None
+        self.connected = False
+        self.clients = []
 
-        self.handler = MessageHandler(self, IRC(self))
+    def disconnect(self):
+        self.connected = False
 
-    def send(self, command, *args):
-        parts = [command]
-        if args:
-            parts.extend([str(arg) for arg in args[:-1]] + [":" + args[-1]])
-        message = " ".join(parts)
+    def add_client(self, client):
+        self.clients.append(client)
+
+        for message in self.handler.irc.server_messages.messages:
+            client.send(message)
+
+    def send(self, message):
         self.outgoing.put_nowait(message)
 
     async def connect(self):
-        host, port, ssl = parse_host_port(self.url)
-        log.info("connecting to %s:%s...", host, port)
-        reader, writer = await asyncio.open_connection(host=host, port=port, ssl=ssl)
+        log.info("connecting to %s:%s...", self.host, self.port)
+        do_ssl = ssl._create_unverified_context() if self.ssl else False
+        reader, writer = await asyncio.open_connection(host=self.host, port=self.port, ssl=do_ssl)
+        self.connected = True
         log.info("connected")
 
+        irc = IRC()
+        self.handler = MessageHandler(self, irc)
         asyncio.ensure_future(self.handle_read(reader))
         asyncio.ensure_future(self.handle_write(writer))
 
-        self.send("NICK", self.nick)
-        self.send("USER", self.nick, "i", "*", self.nick)
+        self.send(Message.nick(self.nick))
+        self.send(Message.user(self.nick))
 
     async def handle_write(self, writer):
-        while True:
+        while self.connected:
             message = await self.outgoing.get()
             if not message:
                 break
-            data = (message + "\r\n").encode()
-            writer.write(data)
+            writer.write(message.serialize())
+        self.connected = False
+        writer.close()
 
     async def handle_read(self, reader):
-        while True:
+        while self.connected:
             data = await reader.readline()
             line = data.decode().strip()
             if not line:
@@ -166,6 +235,21 @@ class Connection(object):
             message = Message.parse(line)
             self.handler.dispatch(message)
 
+            for client in self.clients:
+                client.send(message)
+
+        self.connected = False
+
+
+def connect_to_network(url, nick, server_address):
+    connection = IRCConnection(url, nick)
+    asyncio.ensure_future(connection.connect())
+
+    server = Server(connection)
+    asyncio.ensure_future(server.create(*server_address))
+
+    return connection, server
+
 
 def main(args):
     log.info("server go")
@@ -173,20 +257,24 @@ def main(args):
     loop = asyncio.get_event_loop()
 
     urls = [urlparse(u) for u in args.url]
-    connections = [Connection(url, "gabber") for url in urls]
-    for connection in connections:
-        asyncio.ensure_future(connection.connect())
-
-    coro = asyncio.start_server(handle_client, '127.0.0.1', 6666)
-    server = loop.run_until_complete(coro)
+    connections = []
+    servers = []
+    for i, url in enumerate(urls):
+        address = (args.listen, args.port + i)
+        connection, server = connect_to_network(url, args.nick, address)
+        connections.append(connection)
+        servers.append(server)
+        log.info("%s listening on %s", url.geturl(), address)
 
     try:
         loop.run_forever()
     except KeyboardInterrupt:
         log.info("Shutdown...")
 
-    server.close()
-    loop.run_until_complete(server.wait_closed())
-    loop.close()
+    for server in servers:
+        loop.run_until_complete(server.close())
+
+    for connection in connections:
+        connection.disconnect()
 
     return 0
