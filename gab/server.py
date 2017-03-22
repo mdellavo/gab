@@ -191,6 +191,8 @@ class IRCConnection(object):
 
     def disconnect(self):
         self.connected = False
+        for client in self.clients:
+            client.disconnect()
 
     def add_client(self, client):
         self.clients.append(client)
