@@ -9,6 +9,10 @@ from gab.proto import parsemsg
 
 log = logging.getLogger(__name__)
 
+TERMINATOR = object()
+
+# FIXME client and server need to drain queue before quitting
+
 
 def build_subparser(subparser):
     subparser.add_argument("url", action="append")
@@ -21,20 +25,26 @@ class Client(object):
     def __init__(self, connection):
         self.connection = connection
         self.outgoing = asyncio.Queue()
-        self.connected = True
 
     def disconnect(self):
-        self.connected = False
+        self.send(TERMINATOR)
+        self.connection.remove_client(self)
 
     def send(self, message):
         self.outgoing.put_nowait(message)
 
     async def handle_read(self, reader):
+        self.connected = True
         while self.connected:
-            data = await reader.readline()
+
+            try:
+                data = await reader.readline()
+            except ConnectionResetError:
+                break
             line = data.decode().strip()
             if not line:
                 break
+            log.debug("client read: %s", line)
             message = Message.parse(line)
 
             if message.command in ["NICK", "USER"]:  # dont reauth
@@ -44,12 +54,15 @@ class Client(object):
         self.connected = False
 
     async def handle_write(self, writer):
+        self.connected = True
         while self.connected:
             message = await self.outgoing.get()
-            if not message:
+            if message is TERMINATOR:
                 break
+            log.debug("client wrote: %s", message)
             writer.write(message.serialize())
         self.connected = False
+        await writer.drain()
         writer.close()
 
 
@@ -67,6 +80,8 @@ class Server(object):
 
     def handle_client(self, reader, writer):
         client = Client(self.connection)
+
+        log.debug("client connection from %s", writer.get_extra_info("peername"))
 
         asyncio.ensure_future(client.handle_read(reader))
         asyncio.ensure_future(client.handle_write(writer))
@@ -117,6 +132,14 @@ class Message(object):
     def user(cls, user, realname=None, mode="i"):
         return cls("USER", user, mode, "*", realname or user)
 
+    @classmethod
+    def privmsg(cls, target, msg):
+        return cls("PRIVMSG", target, msg)
+
+    @classmethod
+    def quit(cls, msg):
+        return cls("QUIT", msg)
+
 
 class MessageHandler(object):
     def __init__(self, connection, irc):
@@ -130,6 +153,9 @@ class MessageHandler(object):
             handler(message)
         else:
             log.debug("no handler for message %s", message)
+
+        for client in self.connection.clients:
+            client.send(message)
 
     def gather_server_message(self, message):
         self.irc.add_server_message(message)
@@ -159,6 +185,15 @@ class MessageHandler(object):
     def on_ping(self, message):
         self.connection.send("PONG", message.args[0])
 
+    def on_pong(self, message):
+        pass
+
+    def on_join(self, message):
+        self.irc.join_channel(message.args[0])
+
+    def on_part(self, message):
+        self.irc.part_channel(message.args[0])
+
 
 class MessageBuffer(object):
     def __init__(self):
@@ -170,11 +205,42 @@ class MessageBuffer(object):
     def add(self, message):
         self.messages.append(message)
 
+    def __iter__(self):
+        return iter(self.messages)
+
+
+class Nickname(object):
+    def __init__(self, name):
+        self.name = name
+
+    def __eq__(self, other):
+        return isinstance(other, Nickname) and other.name == self.name
+
+
+class Channel(object):
+    def __init__(self, name):
+        self.name = name
+
+    def __eq__(self, other):
+        return isinstance(other, Channel) and other.name == self.name
+
 
 class IRC(object):
     def __init__(self):
         self.server_messages = MessageBuffer()
         self.clients = collections.OrderedDict()
+        self.channels = collections.OrderedDict()
+
+    def get_channels(self):
+        return self.channels.values()
+
+    def join_channel(self, channel_name):
+        channel = Channel(channel_name)
+        self.channels[channel_name] = channel
+
+    def part_channel(self, channel_name):
+        if channel_name in self.channels:
+            del self.channels[channel_name]
 
     def add_server_message(self, message):
         self.server_messages.add(message)
@@ -185,20 +251,27 @@ class IRCConnection(object):
         self.host, self.port, self.ssl = parse_host_port(url)
         self.nick = nick
         self.outgoing = asyncio.Queue()
-        self.handler = None
-        self.connected = False
         self.clients = []
-
-    def disconnect(self):
+        self.irc = IRC()
         self.connected = False
+
+    def disconnect(self, message="see-ya"):
+        self.send(Message.quit(message))
+
         for client in self.clients:
             client.disconnect()
+
+        self.send(TERMINATOR)
 
     def add_client(self, client):
         self.clients.append(client)
 
-        for message in self.handler.irc.server_messages.messages:
+        for message in self.irc.server_messages:
             client.send(message)
+
+    def remove_client(self, client):
+        if client in self.clients:
+            self.clients.remove(client)
 
     def send(self, message):
         self.outgoing.put_nowait(message)
@@ -210,8 +283,6 @@ class IRCConnection(object):
         self.connected = True
         log.info("connected")
 
-        irc = IRC()
-        self.handler = MessageHandler(self, irc)
         asyncio.ensure_future(self.handle_read(reader))
         asyncio.ensure_future(self.handle_write(writer))
 
@@ -221,25 +292,29 @@ class IRCConnection(object):
     async def handle_write(self, writer):
         while self.connected:
             message = await self.outgoing.get()
-            if not message:
+            if message is TERMINATOR:
                 break
+            log.info("upstream write: %s", message)
             writer.write(message.serialize())
         self.connected = False
+        await writer.drain()
         writer.close()
 
     async def handle_read(self, reader):
+
+        handler = MessageHandler(self, self.irc)
         while self.connected:
-            data = await reader.readline()
+            try:
+                data = await reader.readline()
+            except ConnectionResetError:
+                break
             line = data.decode().strip()
             if not line:
                 break
 
+            log.info("upstream read: %s", line)
             message = Message.parse(line)
-            self.handler.dispatch(message)
-
-            for client in self.clients:
-                client.send(message)
-
+            handler.dispatch(message)
         self.connected = False
 
 
@@ -278,5 +353,8 @@ def main(args):
 
     for connection in connections:
         connection.disconnect()
+
+    pending = asyncio.Task.all_tasks()
+    loop.run_until_complete(asyncio.gather(*pending))
 
     return 0
