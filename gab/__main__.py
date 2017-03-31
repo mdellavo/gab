@@ -10,6 +10,7 @@ log = logging.getLogger(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="gab IRC client")
+    parser.add_argument("--debug", action="store_true")
     parser.set_defaults(server=False, client=False)
     subparsers = parser.add_subparsers()
 
@@ -25,9 +26,10 @@ def parse_args():
 
 
 def main():
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(message)s')
-
     args, print_help = parse_args()
+    level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(level=level, format='%(asctime)s %(message)s')
+
     if args.server:
         rv = server.main(args)
     elif args.client:

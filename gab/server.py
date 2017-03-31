@@ -3,20 +3,21 @@ import logging
 import datetime
 import asyncio
 import collections
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from gab.proto import parsemsg
 
 log = logging.getLogger(__name__)
 
 TERMINATOR = object()
+RECONNECT_TIMEOUT = 10
 
 # FIXME client and server need to drain queue before quitting
 
 
 def build_subparser(subparser):
     subparser.add_argument("url", action="append")
-    subparser.add_argument("--nick", default="gab")
+    subparser.add_argument("--nick", default="gabber")
     subparser.add_argument("--listen", default="localhost")
     subparser.add_argument("--port", default=6666, type=int)
 
@@ -25,6 +26,7 @@ class Client(object):
     def __init__(self, connection):
         self.connection = connection
         self.outgoing = asyncio.Queue()
+        self.connected = False
 
     def disconnect(self):
         self.send(TERMINATOR)
@@ -140,6 +142,10 @@ class Message(object):
     def quit(cls, msg):
         return cls("QUIT", msg)
 
+    @classmethod
+    def pong(cls, target):
+        cls("PONG", target)
+
 
 class MessageHandler(object):
     def __init__(self, connection, irc):
@@ -183,7 +189,7 @@ class MessageHandler(object):
     on_mode = gather_server_message
 
     def on_ping(self, message):
-        self.connection.send("PONG", message.args[0])
+        self.connection.send(Message.pong(message.args[0]))
 
     def on_pong(self, message):
         pass
@@ -193,6 +199,10 @@ class MessageHandler(object):
 
     def on_part(self, message):
         self.irc.part_channel(message.args[0])
+
+    # RPL_NAMREPLY
+    def on_353(self, message):
+        self.irc.get_channels()
 
 
 class MessageBuffer(object):
@@ -231,6 +241,12 @@ class IRC(object):
         self.clients = collections.OrderedDict()
         self.channels = collections.OrderedDict()
 
+    def clear_messages(self):
+        self.server_messages.clear()
+
+    def get_channel(self, name):
+        return self.channels.get(name)
+
     def get_channels(self):
         return self.channels.values()
 
@@ -247,15 +263,19 @@ class IRC(object):
 
 
 class IRCConnection(object):
-    def __init__(self, url, nick):
+    def __init__(self, url, nick, reconnect_timeout=RECONNECT_TIMEOUT):
+        self.url = url
         self.host, self.port, self.ssl = parse_host_port(url)
         self.nick = nick
         self.outgoing = asyncio.Queue()
         self.clients = []
         self.irc = IRC()
+        self.diconnecting = False
         self.connected = False
+        self.reconnect_timeout = reconnect_timeout
 
     def disconnect(self, message="see-ya"):
+        self.diconnecting = True
         self.send(Message.quit(message))
 
         for client in self.clients:
@@ -277,11 +297,24 @@ class IRCConnection(object):
         self.outgoing.put_nowait(message)
 
     async def connect(self):
-        log.info("connecting to %s:%s...", self.host, self.port)
         do_ssl = ssl._create_unverified_context() if self.ssl else False
-        reader, writer = await asyncio.open_connection(host=self.host, port=self.port, ssl=do_ssl)
-        self.connected = True
+
+        reader = writer = None
+        while not self.connected:
+            log.info("connecting to %s:%s...", self.host, self.port)
+
+            try:
+                reader, writer = await asyncio.open_connection(host=self.host, port=self.port, ssl=do_ssl)
+            except ConnectionError as e:
+                log.error("could not connect to %s: '%s'. Reconnecting in %s seconds...", self.url, e, self.reconnect_timeout)
+                await asyncio.sleep(self.reconnect_timeout)
+                continue
+
+            self.connected = True
+
         log.info("connected")
+
+        self.irc.clear_messages()
 
         asyncio.ensure_future(self.handle_read(reader))
         asyncio.ensure_future(self.handle_write(writer))
@@ -294,15 +327,14 @@ class IRCConnection(object):
             message = await self.outgoing.get()
             if message is TERMINATOR:
                 break
-            log.info("upstream write: %s", message)
+            log.debug("upstream write: %s", message)
             writer.write(message.serialize())
-        self.connected = False
-        await writer.drain()
+
         writer.close()
 
     async def handle_read(self, reader):
-
         handler = MessageHandler(self, self.irc)
+
         while self.connected:
             try:
                 data = await reader.readline()
@@ -312,10 +344,15 @@ class IRCConnection(object):
             if not line:
                 break
 
-            log.info("upstream read: %s", line)
+            log.debug("upstream read: %s", line)
             message = Message.parse(line)
             handler.dispatch(message)
         self.connected = False
+
+        if not self.diconnecting:
+            log.info("reconnecting in %s seconds", self.reconnect_timeout)
+            await asyncio.sleep(self.reconnect_timeout)
+            await self.connect()
 
 
 def connect_to_network(url, nick, server_address):
