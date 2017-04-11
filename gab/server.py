@@ -35,10 +35,10 @@ class Client(object):
     def send(self, message):
         self.outgoing.put_nowait(message)
 
-    async def handle_read(self, reader):
+    async def handle_read(self, reader, writer):
         self.connected = True
-        while self.connected:
 
+        while self.connected:
             try:
                 data = await reader.readline()
             except ConnectionResetError:
@@ -49,11 +49,16 @@ class Client(object):
             log.debug("client read: %s", line)
             message = Message.parse(line)
 
-            if message.command in ["NICK", "USER"]:  # dont reauth
+            if message.command == "QUIT":
+                break
+            elif message.command in ["NICK", "USER"]:  # dont reauth
                 continue
 
             self.connection.send(message)
+
         self.connected = False
+        await writer.drain()
+        writer.close()
 
     async def handle_write(self, writer):
         self.connected = True
@@ -85,7 +90,7 @@ class Server(object):
 
         log.debug("client connection from %s", writer.get_extra_info("peername"))
 
-        asyncio.ensure_future(client.handle_read(reader))
+        asyncio.ensure_future(client.handle_read(reader, writer))
         asyncio.ensure_future(client.handle_write(writer))
         self.connection.add_client(client)
 
@@ -127,24 +132,37 @@ class Message(object):
         return cls(command, *args, prefix=prefix)
 
     @classmethod
-    def nick(cls, nick):
-        return cls("NICK", nick)
+    def nick(cls, nick, **kwargs):
+        return cls("NICK", nick, **kwargs)
 
     @classmethod
-    def user(cls, user, realname=None, mode="i"):
-        return cls("USER", user, mode, "*", realname or user)
+    def user(cls, user, realname=None, mode="i", **kwargs):
+        return cls("USER", user, mode, "*", realname or user, **kwargs)
 
     @classmethod
-    def privmsg(cls, target, msg):
-        return cls("PRIVMSG", target, msg)
+    def privmsg(cls, target, msg, **kwargs):
+        return cls("PRIVMSG", target, msg, **kwargs)
 
     @classmethod
-    def quit(cls, msg):
-        return cls("QUIT", msg)
+    def quit(cls, msg, **kwargs):
+        return cls("QUIT", msg, **kwargs)
 
     @classmethod
-    def pong(cls, target):
-        cls("PONG", target)
+    def pong(cls, target, **kwargs):
+        return cls("PONG", target, **kwargs)
+
+    @classmethod
+    def join(cls, channel, **kwargs):
+        return cls("JOIN", channel, **kwargs)
+
+    @classmethod
+    def reply_namesreply(cls, nick, channel, **kwargs):
+        names = " ".join([nick.name for nick in channel.members])
+        return cls("353", nick, "=", channel.name, names, **kwargs)
+
+    @classmethod
+    def reply_endnamesreply(cls, nick, channel, **kwargs):
+        return cls("366", nick, channel.name, "End of /NAMES list.", **kwargs)
 
 
 class MessageHandler(object):
@@ -202,7 +220,12 @@ class MessageHandler(object):
 
     # RPL_NAMREPLY
     def on_353(self, message):
-        self.irc.get_channels()
+        channel_name = message.args[2]
+        channel = self.irc.get_channel(channel_name)
+        if channel:
+            nicks = message.args[3].split()
+            for nick in nicks:
+                channel.add_nick(Nickname(nick))
 
 
 class MessageBuffer(object):
@@ -230,9 +253,18 @@ class Nickname(object):
 class Channel(object):
     def __init__(self, name):
         self.name = name
+        self.members = []
 
     def __eq__(self, other):
         return isinstance(other, Channel) and other.name == self.name
+
+    def add_nick(self, nickname):
+        if nickname not in self.members:
+            self.members.append(nickname)
+
+    def remove_nick(self, nickname):
+        if nickname in self.members:
+            self.members.remove(nickname)
 
 
 class IRC(object):
@@ -288,6 +320,11 @@ class IRCConnection(object):
 
         for message in self.irc.server_messages:
             client.send(message)
+
+        for channel in self.irc.get_channels():
+            client.send(Message.join(channel.name, prefix=self.nick))
+            client.send(Message.reply_namesreply(self.nick, channel, prefix=self.host))
+            client.send(Message.reply_endnamesreply(self.nick, channel, prefix=self.host))
 
     def remove_client(self, client):
         if client in self.clients:
